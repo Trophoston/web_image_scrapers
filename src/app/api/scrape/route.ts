@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { chromium } from 'playwright';
+import * as cheerio from 'cheerio';
 
 function cleanUrl(baseUrl: string, url: string) {
   try {
@@ -23,106 +23,88 @@ export async function POST(req: Request) {
       targetUrl = 'https://' + targetUrl;
     }
 
-    const browser = await chromium.launch({ headless: true });
-    const context = await browser.newContext({
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36',
-      viewport: { width: 1280, height: 800 },
-    });
-    const page = await context.newPage();
-
-    const imageUrls = new Set<string>();
-
-    page.on('response', response => {
-      try {
-        const respUrl = response.url();
-        const contentType = response.headers()['content-type'] || '';
-        if (contentType.startsWith('image/') && !respUrl.startsWith('data:') && !respUrl.startsWith('blob:')) {
-          imageUrls.add(respUrl);
-        } else if (respUrl.match(/\.(png|jpe?g|gif|svg|webp|avif)(?:\?.*)?$/i) && !respUrl.startsWith('data:') && !respUrl.startsWith('blob:')) {
-          imageUrls.add(respUrl);
-        }
-      } catch (e) {
-        // ignore
+    const response = await fetch(targetUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36'
       }
     });
 
-    try {
-      await page.goto(targetUrl, { waitUntil: 'load', timeout: 10000 });
-      // Scroll down repeatedly to load lazy images if any
-      await page.evaluate(async () => {
-         for (let i = 0; i < 5; i++) {
-            window.scrollBy(0, window.innerHeight);
-            await new Promise(resolve => setTimeout(resolve, 500));
-         }
-      });
-    } catch(e) {
-      console.log('Timeout or error loading, continuing with what we have.', e);
+    if (!response.ok) {
+       throw new Error(`Failed to fetch page: ${response.statusText}`);
     }
 
-    const domImages = await page.evaluate(() => {
-      const urls = new Set<string>();
-      
-      const images = Array.from(document.querySelectorAll('img'));
-      images.forEach(img => {
-        if (img.src) urls.add(img.src);
-        if (img.dataset?.src) urls.add(img.dataset.src);
-        if (img.srcset) {
-           const parts = img.srcset.split(',');
-           parts.forEach(p => {
-              const u = p.split(' ')[0].trim();
-              if (u) urls.add(u);
-           });
-        }
-      });
+    const finalUrl = response.url || targetUrl;
+    const baseForRelative = finalUrl.endsWith('/') ? finalUrl : finalUrl + '/';
 
-      const allElements = document.querySelectorAll('*');
-      allElements.forEach(el => {
-        const style = window.getComputedStyle(el);
-        const bgMatch = style.backgroundImage.match(/url\((['"]?)(.*?)\1\)/);
-        if (bgMatch && bgMatch[2] && bgMatch[2] !== 'none') {
-           urls.add(bgMatch[2]);
-        }
-      });
-      
-      const scripts = Array.from(document.querySelectorAll('script'));
-      scripts.forEach(script => {
-         const text = script.textContent || '';
-         const matches = text.match(/(?:https?:\/\/[^\s"'<>\[\]\\,]+|\/?[^\s"'<>\[\]\\,]+)\.(?:jpg|jpeg|png|gif|webp|svg|avif)/gi);
-         if (matches) {
-            matches.forEach(m => urls.add(m));
-         }
-      });
+    const html = await response.text();
+    const $ = cheerio.load(html);
+    const imageUrls = new Set<string>();
 
-      const metas = Array.from(document.querySelectorAll('meta'));
-      metas.forEach(meta => {
-         if (meta.getAttribute('property') === 'og:image' || meta.getAttribute('name') === 'twitter:image') {
-             const c = meta.getAttribute('content');
-             if (c) urls.add(c);
-         }
-      });
+    // 1. Traditional Cheerio DOM parsing
+    $('img').each((_, el) => {
+      const src = $(el).attr('src');
+      if (src) imageUrls.add(src);
 
-      return Array.from(urls);
-    });
+      const dataSrc = $(el).attr('data-src') || $(el).attr('data-original') || $(el).attr('data-lazy-src');
+      if (dataSrc) imageUrls.add(dataSrc);
 
-    const finalBase = page.url() + (page.url().endsWith('/') ? '' : '/');
-    await browser.close();
-
-    domImages.forEach(u => {
-      if (!u) return;
-      let decoded = u;
-      try {
-         decoded = decoded.replace(/\\u[\dA-F]{4}/gi, (match) => String.fromCharCode(parseInt(match.replace(/\\u/g, ''), 16))).replace(/\\\//g, '/');
-      } catch (e) {}
-
-      const cleaned = cleanUrl(finalBase, decoded);
-      if (cleaned && !cleaned.startsWith('data:') && !cleaned.startsWith('blob:')) {
-        imageUrls.add(cleaned);
+      const srcset = $(el).attr('srcset') || $(el).attr('data-srcset');
+      if (srcset) {
+        srcset.split(',').forEach(part => {
+          const u = part.trim().split(' ')[0];
+          if (u) imageUrls.add(u);
+        });
       }
     });
 
-    const finalUrls = Array.from(imageUrls).filter(u => u.trim() !== '' && !u.startsWith('blob:'));
+    $('[style*="background-image"]').each((_, el) => {
+       const style = $(el).attr('style') || '';
+       const match = style.match(/url\(['"]?([^'"()]+)['"]?\)/);
+       if (match && match[1]) imageUrls.add(match[1]);
+    });
 
-    return NextResponse.json({ images: finalUrls });
+    $('meta[property="og:image"], meta[name="twitter:image"]').each((_, el) => {
+       const content = $(el).attr('content');
+       if (content) imageUrls.add(content);
+    });
+
+    // 2. Fallback SPA / JSON / Next.js extraction (Canva support!)
+    // We safely parse out strings from script tags without vulnerable regex
+    const scriptText = $('script').map((_, el) => $(el).html()).get().join(' ');
+    
+    // Instead of regex, split script text by all quotes to find string values
+    const quoteParts = scriptText.split(/["']/);
+    for (let part of quoteParts) {
+       part = part.trim();
+       if (part.length > 5 && part.length < 1000) {
+          try {
+             part = part.replace(/\\u[\dA-F]{4}/gi, (match) => String.fromCharCode(parseInt(match.replace(/\\u/g, ''), 16))).replace(/\\\//g, '/');
+          } catch(e) {}
+          
+          if (
+             part.includes('.jpg') || part.includes('.jpeg') || 
+             part.includes('.png') || part.includes('.webp') || part.includes('.gif') || part.includes('.svg') || part.includes('.avif') || part.includes('_assets/') || part.includes('/media/') || part.includes('/images/')
+          ) {
+             if (part.startsWith('http') || part.startsWith('/') || part.match(/^[a-zA-Z0-9_\-\.\/]+\.(?:png|jpe?g|gif|webp|svg|avif)$/i) || part.match(/^[a-zA-Z0-9_\-\.\/]+(?:_assets|\/media\/).+$/i)) {
+                 imageUrls.add(part);
+             }
+          }
+       }
+    }
+
+    const finalImages: string[] = [];
+
+    Array.from(imageUrls).forEach(u => {
+      const cleaned = cleanUrl(baseForRelative, u);
+      if (cleaned && !cleaned.startsWith('data:') && !cleaned.startsWith('blob:')) {
+         if (cleaned.match(/\.(woff2?|ttf|js|css|json|html|xml)$/i)) return;
+         finalImages.push(cleaned);
+      }
+    });
+
+    const uniqueImages = Array.from(new Set(finalImages)).filter(u => u.trim() !== '');
+
+    return NextResponse.json({ images: uniqueImages });
   } catch (error: any) {
     console.error('Scraping error:', error);
     return NextResponse.json(
