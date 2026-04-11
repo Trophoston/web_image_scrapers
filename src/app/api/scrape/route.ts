@@ -92,17 +92,111 @@ export async function POST(req: Request) {
        }
     }
 
-    const finalImages: string[] = [];
+    function getDedupeKey(urlStr: string) {
+      try {
+        const parsed = new URL(urlStr);
+        let pathForDedupe = parsed.pathname;
+
+        // 1. Next.js Image proxy check
+        if (pathForDedupe.startsWith('/_next/image') && parsed.searchParams.has('url')) {
+            const underlyingUrl = parsed.searchParams.get('url');
+            if (underlyingUrl) return underlyingUrl; // use the true target as dedupe key
+        }
+
+        // 2. Cloudflare Images
+        if (pathForDedupe.startsWith('/cdn-cgi/image/')) {
+            pathForDedupe = pathForDedupe.replace(/\/cdn-cgi\/image\/[^\/]+\//, '/');
+        }
+
+        // 3. Nuxt / IPX
+        if (pathForDedupe.startsWith('/_ipx/')) {
+            pathForDedupe = pathForDedupe.replace(/\/_ipx\/[^\/]+\//, '/');
+        }
+
+        // 4. Shopify variants: _800x.jpg, _1024x1024_crop_center.png
+        pathForDedupe = pathForDedupe.replace(/_[0-9]+x[0-9]*(_crop_[a-z]+)?\.(png|jpe?g|gif|webp|avif)$/i, '.$2');
+        pathForDedupe = pathForDedupe.replace(/@[0-9]+x\.(png|jpe?g|gif|webp|avif)$/i, '.$1');
+
+        // 5. WordPress styles: -150x150.jpg
+        pathForDedupe = pathForDedupe.replace(/-\d+x\d+\.(png|jpe?g|gif|webp|avif)$/i, '.$1');
+
+        // 6. Pinterest styles
+        if (parsed.hostname.includes('pinimg.com')) {
+            pathForDedupe = pathForDedupe.replace(/\/(?:\d+x|736x|474x|236x)\//i, '/originals/');
+        }
+
+        if (pathForDedupe.match(/\.(png|jpe?g|gif|webp|svg|avif)$/i)) {
+            return parsed.host + pathForDedupe;
+        }
+
+        // 7. Generic Query-based resizers (strip sizing query params)
+        let hasResizeParams = false;
+        const cleanParams = new URLSearchParams(parsed.searchParams);
+        ['w', 'h', 'width', 'height', 'size', 'resize', 'fit', 'q', 'quality', 'auto', 'format', 'crop', 'dpr'].forEach(k => {
+            if (cleanParams.has(k)) {
+                hasResizeParams = true;
+                cleanParams.delete(k);
+            }
+        });
+        
+        if (hasResizeParams) {
+            parsed.search = cleanParams.toString();
+            return parsed.toString();
+        }
+
+        return urlStr;
+      } catch(e) {
+        return urlStr;
+      }
+    }
+
+    function getUrlScore(urlStr: string) {
+      let score = 0;
+      
+      if (!urlStr.match(/-\d+x\d+\.(png|jpe?g|gif|webp|avif)(?:\?|$)/i)) score += 10;
+      if (!urlStr.match(/_(?:150|200|250|300|400)x(?:150|200|250|300|400)(?:_crop_center)?\.(png|jpe?g|gif|webp|avif)(?:\?|$)/i)) score += 10;
+
+      try {
+          const parsed = new URL(urlStr);
+          let wMatch = parsed.searchParams.get('w') || parsed.searchParams.get('width');
+          if (wMatch) {
+              const w = parseInt(wMatch, 10);
+              if (!isNaN(w)) {
+                  // Boost score progressively by resolution size
+                  score += (w / 100); 
+              }
+          } else {
+              // Usually the original lacks width limits
+              score += 30;
+          }
+      } catch(e) {}
+      
+      if (urlStr.includes('/originals/')) score += 50;
+      return score;
+    }
+
+    const uniqueImagesMap = new Map<string, string>();
 
     Array.from(imageUrls).forEach(u => {
       const cleaned = cleanUrl(baseForRelative, u);
       if (cleaned && !cleaned.startsWith('data:') && !cleaned.startsWith('blob:')) {
-         if (cleaned.match(/\.(woff2?|ttf|js|css|json|html|xml)$/i)) return;
-         finalImages.push(cleaned);
+         if (cleaned.match(/\.(woff2?|ttf|js|css|json|html|xml)(?:\?.*)?$/i)) return;
+         
+         const key = getDedupeKey(cleaned);
+         const currentScore = getUrlScore(cleaned);
+         
+         if (!uniqueImagesMap.has(key)) {
+             uniqueImagesMap.set(key, cleaned);
+         } else {
+             const existingUrl = uniqueImagesMap.get(key)!;
+             if (currentScore > getUrlScore(existingUrl)) {
+                 uniqueImagesMap.set(key, cleaned);
+             }
+         }
       }
     });
 
-    const uniqueImages = Array.from(new Set(finalImages)).filter(u => u.trim() !== '');
+    const uniqueImages = Array.from(uniqueImagesMap.values()).filter(u => u.trim() !== '');
 
     return NextResponse.json({ images: uniqueImages });
   } catch (error: any) {
